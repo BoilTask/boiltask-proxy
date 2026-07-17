@@ -1,0 +1,3 @@
+name = "boiltask-proxy"
+main = "src/index.ts"
+compatibility_date = "2025-07-17"
