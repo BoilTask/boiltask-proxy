@@ -6,7 +6,8 @@
  *   POST /?url=https://example.com/upload  (带 body)
  *
  * 浏览器 fetch 效果与直接访问目标 URL 一致。
- * HTML 页面中的链接会自动改写为走代理的地址。
+ * - HTML 静态属性 URL 自动改写
+ * - JS 动态 API（fetch/XHR/history/open 等）也自动拦截改写
  */
 
 // ─── 不解密的 Hop-by-hop 头（不应转发） ───
@@ -89,23 +90,17 @@ function rewriteURL(raw: string, proxyOrigin: string, targetOrigin: string): str
 
   try {
     const absolute = new URL(raw, targetOrigin).toString();
-    // 不改写非同源的 URL（外部 CDN、第三方资源等）
-    // 如需跨域加载外部资源，注释掉下面这行
-    // if (!absolute.startsWith(targetOrigin)) return null;
     return `${proxyOrigin}/?url=${encodeURIComponent(absolute)}`;
   } catch {
     return null;
   }
 }
 
-// ─── srcset 改写 ───
-
 function rewriteSrcset(raw: string, proxyOrigin: string, targetOrigin: string): string | null {
   if (!raw) return null;
 
   const parts = raw.split(",").map((entry) => {
     const trimmed = entry.trim();
-    // 格式: "url 1x" 或 "url 480w"
     const match = trimmed.match(/^(\S+)(\s+.+)?$/);
     if (!match) return entry;
 
@@ -119,11 +114,106 @@ function rewriteSrcset(raw: string, proxyOrigin: string, targetOrigin: string): 
   return result !== raw ? result : null;
 }
 
+// ─── JS Shim：拦截浏览器运行时 API ───
+
+function jsShim(proxyOrigin: string, targetOrigin: string): string {
+  return `(function(){
+var P="${proxyOrigin}",T="${targetOrigin}";
+function R(u){
+  if(!u||/^(#|javascript:|mailto:|tel:|data:|blob:|about:)/i.test(u))return u;
+  try{var a=new URL(u,T).toString();return P+"/?url="+encodeURIComponent(a);}
+  catch(e){return u;}
+}
+function S(p,n,f){
+  try{var d=Object.getOwnPropertyDescriptor(p,n);if(!d||!d.configurable)return;var o=d.set,g=d.get;Object.defineProperty(p,n,{get:g,set:function(v){o.call(this,f?f(v):v)},configurable:!0});}
+  catch(e){}
+}
+
+// 1. fetch()
+var _f=window.fetch;
+window.fetch=function(i,o){
+  if(typeof i==="string")i=R(i);
+  else if(i instanceof Request)try{i=new Request(R(i.url),i);}catch(e){}
+  return _f.call(this,i,o);
+};
+window.fetch.toString=function(){return _f.toString();};
+
+// 2. XMLHttpRequest
+var _x=XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open=function(m,u){return _x.apply(this,[m,R(u)].concat([].slice.call(arguments,2)));};
+
+// 3. history.pushState / replaceState
+var _h={ps:history.pushState,rs:history.replaceState};
+history.pushState=function(s,t,u){return _h.ps.apply(this,u?[s,t,R(u)]:[s,t]);};
+history.replaceState=function(s,t,u){return _h.rs.apply(this,u?[s,t,R(u)]:[s,t]);};
+
+// 4. window.open
+var _wo=window.open;
+window.open=function(u,n,f){return _wo.call(this,R(u),n,f);};
+
+// 5. EventSource
+if(window.EventSource){
+  var _es=window.EventSource;
+  window.EventSource=function(u,c){return new _es(R(u),c);};
+  window.EventSource.prototype=_es.prototype;
+  window.EventSource.CONNECTING=_es.CONNECTING;
+  window.EventSource.OPEN=_es.OPEN;
+  window.EventSource.CLOSED=_es.CLOSED;
+}
+
+// 6. WebSocket
+if(window.WebSocket){
+  var _ws=window.WebSocket;
+  window.WebSocket=function(u,p){return new _ws(R(u),p);};
+  window.WebSocket.prototype=_ws.prototype;
+  window.WebSocket.CONNECTING=_ws.CONNECTING;
+  window.WebSocket.OPEN=_ws.OPEN;
+  window.WebSocket.CLOSING=_ws.CLOSING;
+  window.WebSocket.CLOSED=_ws.CLOSED;
+}
+
+// 7. location.assign / replace
+try{
+  var _la=location.assign.bind(location);
+  var _lr=location.replace.bind(location);
+  location.assign=function(u){return _la(R(u));};
+  location.replace=function(u){return _lr(R(u));};
+}catch(e){}
+
+// 8. Element 属性 setter（拦截 img.src = "..." 等动态赋值）
+var props={
+  HTMLImageElement:["src","srcset"],HTMLScriptElement:["src"],
+  HTMLLinkElement:["href"],HTMLAnchorElement:["href"],
+  HTMLIFrameElement:["src"],HTMLEmbedElement:["src"],
+  HTMLVideoElement:["src","poster"],HTMLAudioElement:["src"],
+  HTMLSourceElement:["src","srcset"],HTMLTrackElement:["src"],
+  HTMLFormElement:["action"],HTMLObjectElement:["data"]
+};
+Object.keys(props).forEach(function(t){
+  var e=window[t];if(!e||!e.prototype)return;
+  props[t].forEach(function(n){
+    n==="srcset"?S(e.prototype,n,function(v){return v.split(",").map(function(e){var t=e.trim(),m=t.match(/^(\\S+)(\\s+.+)?$/);if(!m)return e;var r=R(m[1]);return m[2]?r+m[2]:r;}).join(",");}):S(e.prototype,n,R);
+  });
+});
+
+// 9. setAttribute / setAttributeNS
+var ATTRS=["href","src","action","data","poster"];
+var _sa=Element.prototype.setAttribute;
+Element.prototype.setAttribute=function(n,v){
+  if(ATTRS.indexOf(n.toLowerCase())!==-1)v=R(v);
+  return _sa.call(this,n,v);
+};
+var _san=Element.prototype.setAttributeNS;
+Element.prototype.setAttributeNS=function(ns,n,v){
+  if(ATTRS.indexOf(n.toLowerCase())!==-1)v=R(v);
+  return _san.call(this,ns,n,v);
+};
+
+})();`;
+}
+
 // ─── HTMLRewriter 处理器 ───
 
-/**
- * 通用单属性 URL 改写器
- */
 function urlHandler(attr: string, proxyOrigin: string, targetOrigin: string) {
   return {
     element(element: Element) {
@@ -135,9 +225,6 @@ function urlHandler(attr: string, proxyOrigin: string, targetOrigin: string) {
   };
 }
 
-/**
- * srcset 属性改写器
- */
 function srcsetHandler(proxyOrigin: string, targetOrigin: string) {
   return {
     element(element: Element) {
@@ -149,9 +236,6 @@ function srcsetHandler(proxyOrigin: string, targetOrigin: string) {
   };
 }
 
-/**
- * <base href> 改写器
- */
 function baseHandler(proxyOrigin: string, targetOrigin: string) {
   return {
     element(element: Element) {
@@ -165,7 +249,19 @@ function baseHandler(proxyOrigin: string, targetOrigin: string) {
 }
 
 /**
- * 用 HTMLRewriter 流式改写页面中的 URL
+ * 注入 JS shim 到 <head> 最前面（在所有脚本之前执行）
+ */
+function injectShim(proxyOrigin: string, targetOrigin: string) {
+  const shim = jsShim(proxyOrigin, targetOrigin);
+  return {
+    element(element: Element) {
+      element.prepend(`<script>${shim}<\/script>`, { html: true });
+    },
+  };
+}
+
+/**
+ * 用 HTMLRewriter 流式改写页面中的 URL + 注入 shim
  */
 function rewriteHTML(
   body: ReadableStream<Uint8Array> | null,
@@ -175,6 +271,8 @@ function rewriteHTML(
   if (!body) return null;
 
   const rewriter = new HTMLRewriter()
+    // 注入 JS shim（最先执行）
+    .on('head', injectShim(proxyOrigin, targetOrigin))
     // href
     .on("a[href]", urlHandler("href", proxyOrigin, targetOrigin))
     .on("link[href]", urlHandler("href", proxyOrigin, targetOrigin))
@@ -305,7 +403,7 @@ export default {
     }
     responseHeaders.set("Access-Control-Expose-Headers", "*");
 
-    // ── 如果是 HTML，用 HTMLRewriter 流式改写页面中的 URL ──
+    // ── 如果是 HTML，用 HTMLRewriter 流式改写页面中的 URL + 注入 shim ──
     const contentType = response.headers.get("Content-Type") || "";
     let body = response.body;
     if (contentType.includes("text/html")) {
