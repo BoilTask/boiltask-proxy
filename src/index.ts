@@ -20,6 +20,9 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
+// 内部标记头：防止 Worker 子请求被自身再次拦截导致死循环
+const INTERNAL_MARKER = "X-Proxy-Internal";
+
 // ─── 提取目标 URL ───
 
 function extractTargetURL(request: Request): string | null {
@@ -44,7 +47,7 @@ function filterHeaders(headers: Headers): Record<string, string> {
   const result: Record<string, string> = {};
   headers.forEach((value, key) => {
     const lower = key.toLowerCase();
-    if (!HOP_BY_HOP_HEADERS.has(lower)) {
+    if (!HOP_BY_HOP_HEADERS.has(lower) && lower !== INTERNAL_MARKER.toLowerCase()) {
       result[key] = value;
     }
   });
@@ -76,29 +79,27 @@ function errorResponse(status: number, message: string, request: Request): Respo
   });
 }
 
-// ─── 带循环检测的手动重定向跟随 ───
+// ─── 代理请求（手动跟随重定向 + 循环检测）──
 
-async function followRedirects(
-  url: string,
+async function doProxy(
+  targetURL: string,
   request: Request,
   maxRedirects: number = 10,
 ): Promise<Response> {
   const visited = new Set<string>();
-  let currentURL = url;
+  let currentURL = targetURL;
 
   for (let i = 0; i < maxRedirects; i++) {
-    // 循环检测
     if (visited.has(currentURL)) {
-      return errorResponse(
-        508,
-        `检测到重定向循环: ${currentURL} 被重复访问`,
-        request,
-      );
+      return errorResponse(508, `检测到重定向循环: ${currentURL}`, request);
     }
     visited.add(currentURL);
 
     const forwardedHeaders = filterHeaders(request.headers);
     delete forwardedHeaders["host"];
+
+    // 标记为内部请求，防止 Worker 重复拦截
+    forwardedHeaders[INTERNAL_MARKER] = "1";
 
     const proxyRequest = new Request(currentURL, {
       method: request.method,
@@ -115,18 +116,15 @@ async function followRedirects(
       return errorResponse(502, `代理请求失败: ${message}`, request);
     }
 
-    // 不是重定向 → 返回最终响应
     if (response.status < 300 || response.status >= 400) {
       return response;
     }
 
-    // 是重定向 → 跟随 Location
     const location = response.headers.get("Location");
     if (!location) {
-      return response; // 无 Location 头，直接返回
+      return response;
     }
 
-    // 解析相对 URL
     currentURL = new URL(location, currentURL).toString();
   }
 
@@ -140,6 +138,12 @@ async function followRedirects(
 export default {
   async fetch(request: Request): Promise<Response> {
     const corsRespHeaders = corsHeaders(request);
+
+    // ── 内部标记：Worker 自己的子请求，直接放行 ──
+    if (request.headers.get(INTERNAL_MARKER) === "1") {
+      // 移除标记后直接传给源站，不再走代理逻辑
+      return fetch(request);
+    }
 
     // ── OPTIONS 预检请求 ──
     if (request.method === "OPTIONS") {
@@ -166,8 +170,8 @@ export default {
       return errorResponse(400, `无效的目标 URL: ${targetURL}`, request);
     }
 
-    // ── 发起请求（带循环检测的手动重定向跟随）──
-    const response = await followRedirects(parsedTarget.toString(), request);
+    // ── 发起代理请求 ──
+    const response = await doProxy(parsedTarget.toString(), request);
 
     // ── 构建响应（过滤 hop-by-hop 响应头 + 追加 CORS 头）──
     const responseHeaders = new Headers();
@@ -178,7 +182,6 @@ export default {
       }
     });
 
-    // 附加 CORS 头
     for (const [key, value] of Object.entries(corsRespHeaders)) {
       responseHeaders.set(key, value);
     }
