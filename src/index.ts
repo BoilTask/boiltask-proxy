@@ -120,6 +120,7 @@ export default {
       method: request.method,
       headers: forwardedHeaders,
       body: request.method !== "GET" && request.method !== "HEAD" ? request.body : undefined,
+      redirect: "manual",
     });
 
     // ── 发起请求 ──
@@ -139,6 +140,13 @@ export default {
         responseHeaders.set(key, value);
       }
     });
+
+    // ── 重写 Location 头：让浏览器重定向也走代理 ──
+    if (response.status >= 300 && response.status < 400 && response.headers.has("Location")) {
+      const location = response.headers.get("Location")!;
+      const proxyBase = new URL(request.url).origin;
+      responseHeaders.set("Location", `${proxyBase}/?url=${encodeURIComponent(location)}`);
+    }
 
     // 附加 CORS 头
     for (const [key, value] of Object.entries(corsRespHeaders)) {
