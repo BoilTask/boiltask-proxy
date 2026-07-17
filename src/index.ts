@@ -2,8 +2,8 @@
  * Cloudflare Worker 跨域透明代理
  *
  * 使用方式：
- *   GET  /proxy?url=https://example.com/api/data
- *   POST /proxy?url=https://example.com/upload  (带 body)
+ *   GET  /?url=https://example.com/api/data
+ *   POST /?url=https://example.com/upload  (带 body)
  *
  * 浏览器 fetch 效果与直接访问目标 URL 一致。
  */
@@ -25,13 +25,11 @@ const HOP_BY_HOP_HEADERS = new Set([
 function extractTargetURL(request: Request): string | null {
   const url = new URL(request.url);
 
-  // 方式 1：查询参数 ?url=...
   const queryTarget = url.searchParams.get("url");
   if (queryTarget) {
     return queryTarget;
   }
 
-  // 方式 2：自定义请求头 X-Proxy-Target
   const headerTarget = request.headers.get("X-Proxy-Target");
   if (headerTarget) {
     return headerTarget;
@@ -78,6 +76,63 @@ function errorResponse(status: number, message: string, request: Request): Respo
   });
 }
 
+// ─── 带循环检测的手动重定向跟随 ───
+
+async function followRedirects(
+  url: string,
+  request: Request,
+  maxRedirects: number = 10,
+): Promise<Response> {
+  const visited = new Set<string>();
+  let currentURL = url;
+
+  for (let i = 0; i < maxRedirects; i++) {
+    // 循环检测
+    if (visited.has(currentURL)) {
+      return errorResponse(
+        508,
+        `检测到重定向循环: ${currentURL} 被重复访问`,
+        request,
+      );
+    }
+    visited.add(currentURL);
+
+    const forwardedHeaders = filterHeaders(request.headers);
+    delete forwardedHeaders["host"];
+
+    const proxyRequest = new Request(currentURL, {
+      method: request.method,
+      headers: forwardedHeaders,
+      body: request.method !== "GET" && request.method !== "HEAD" ? request.body : undefined,
+      redirect: "manual",
+    });
+
+    let response: Response;
+    try {
+      response = await fetch(proxyRequest);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return errorResponse(502, `代理请求失败: ${message}`, request);
+    }
+
+    // 不是重定向 → 返回最终响应
+    if (response.status < 300 || response.status >= 400) {
+      return response;
+    }
+
+    // 是重定向 → 跟随 Location
+    const location = response.headers.get("Location");
+    if (!location) {
+      return response; // 无 Location 头，直接返回
+    }
+
+    // 解析相对 URL
+    currentURL = new URL(location, currentURL).toString();
+  }
+
+  return errorResponse(508, `超过最大重定向次数 (${maxRedirects})`, request);
+}
+
 // ═══════════════════════════════════════════════
 //  Worker 入口
 // ═══════════════════════════════════════════════
@@ -111,26 +166,8 @@ export default {
       return errorResponse(400, `无效的目标 URL: ${targetURL}`, request);
     }
 
-    // ── 构建转发请求 ──
-    const forwardedHeaders = filterHeaders(request.headers);
-    // 清除 Host（让 fetch 自动设置目标 Host）
-    delete forwardedHeaders["host"];
-
-    const proxyRequest = new Request(parsedTarget.toString(), {
-      method: request.method,
-      headers: forwardedHeaders,
-      body: request.method !== "GET" && request.method !== "HEAD" ? request.body : undefined,
-      redirect: "manual",
-    });
-
-    // ── 发起请求 ──
-    let response: Response;
-    try {
-      response = await fetch(proxyRequest);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return errorResponse(502, `代理请求失败: ${message}`, request);
-    }
+    // ── 发起请求（带循环检测的手动重定向跟随）──
+    const response = await followRedirects(parsedTarget.toString(), request);
 
     // ── 构建响应（过滤 hop-by-hop 响应头 + 追加 CORS 头）──
     const responseHeaders = new Headers();
@@ -141,19 +178,11 @@ export default {
       }
     });
 
-    // ── 重写 Location 头：让浏览器重定向也走代理 ──
-    if (response.status >= 300 && response.status < 400 && response.headers.has("Location")) {
-      const location = response.headers.get("Location")!;
-      const proxyBase = new URL(request.url).origin;
-      responseHeaders.set("Location", `${proxyBase}/?url=${encodeURIComponent(location)}`);
-    }
-
     // 附加 CORS 头
     for (const [key, value] of Object.entries(corsRespHeaders)) {
       responseHeaders.set(key, value);
     }
 
-    // 暴露所有响应头给浏览器
     responseHeaders.set("Access-Control-Expose-Headers", "*");
 
     return new Response(response.body, {
